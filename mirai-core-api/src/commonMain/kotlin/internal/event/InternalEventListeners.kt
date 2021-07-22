@@ -15,6 +15,8 @@ import kotlinx.coroutines.sync.withLock
 import net.mamoe.mirai.event.*
 import net.mamoe.mirai.event.events.BotEvent
 import net.mamoe.mirai.utils.MiraiLogger
+import net.mamoe.mirai.utils.lateinitMutableProperty
+import net.mamoe.mirai.utils.systemProp
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.coroutines.CoroutineContext
@@ -29,7 +31,7 @@ internal class Handler<in E : Event> internal constructor(
     subscriberContext: CoroutineContext,
     @JvmField val handler: suspend (E) -> ListeningStatus,
     override val concurrencyKind: ConcurrencyKind,
-    override val priority: EventPriority
+    override val priority: EventPriority,
 ) : Listener<E>, CompletableJob by SupervisorJob(parentJob) { // avoid being cancelled on handling event
 
     private val subscriberContext: CoroutineContext = subscriberContext + this // override Job.
@@ -70,7 +72,7 @@ internal class Handler<in E : Event> internal constructor(
 
 internal class ListenerRegistry(
     val listener: Listener<Event>,
-    val type: KClass<out Event>
+    val type: KClass<out Event>,
 )
 
 
@@ -97,66 +99,66 @@ internal object GlobalEventListeners {
 }
 
 
-// inline: NO extra Continuation
-@Suppress("UNCHECKED_CAST")
-internal suspend inline fun AbstractEvent.broadcastInternal() {
-    if (EventDisabled) return
-    callAndRemoveIfRequired(this@broadcastInternal)
-}
-
-internal inline fun <E, T : Iterable<E>> T.forEach0(block: T.(E) -> Unit) {
-    forEach { block(it) }
-}
-
-@Suppress("DuplicatedCode")
-internal suspend inline fun <E : AbstractEvent> callAndRemoveIfRequired(
-    event: E
-) {
+internal suspend fun <E : AbstractEvent> callAndRemoveIfRequired(event: E) {
     for (p in EventPriority.prioritiesExcludedMonitor) {
-        GlobalEventListeners[p].forEach0 { registeredRegistry ->
-            if (event.isIntercepted) {
-                return
-            }
-            if (!registeredRegistry.type.isInstance(event)) return@forEach0
-            val listener = registeredRegistry.listener
-            when (listener.concurrencyKind) {
-                ConcurrencyKind.LOCKED -> {
-                    (listener as Handler).lock!!.withLock {
-                        if (listener.onEvent(event) == ListeningStatus.STOPPED) {
-                            remove(registeredRegistry)
-                        }
-                    }
-                }
-                ConcurrencyKind.CONCURRENT -> {
-                    if (listener.onEvent(event) == ListeningStatus.STOPPED) {
-                        remove(registeredRegistry)
-                    }
+        val container = GlobalEventListeners[p]
+        for (registry in container) {
+            if (event.isIntercepted) return
+            if (!registry.type.isInstance(event)) continue
+            val listener = registry.listener
+            process(container, registry, listener, event)
+        }
+    }
+
+    if (event.isIntercepted) return
+    val container = GlobalEventListeners[EventPriority.MONITOR]
+    when (container.size) {
+        0 -> return
+        1 -> {
+            val registry = container.firstOrNull() ?: return
+            if (!registry.type.isInstance(event)) return
+            process(container, registry, registry.listener, event)
+        }
+        else -> supervisorScope {
+            for (registry in GlobalEventListeners[EventPriority.MONITOR]) {
+                if (!registry.type.isInstance(event)) continue
+                launch(start = if (EVENT_LAUNCH_UNDISPATCHED) CoroutineStart.UNDISPATCHED else CoroutineStart.DEFAULT) {
+                    process(container, registry, registry.listener, event)
                 }
             }
         }
     }
-    coroutineScope {
-        GlobalEventListeners[EventPriority.MONITOR].forEach0 { registeredRegistry ->
-            if (event.isIntercepted) {
-                return@coroutineScope
-            }
-            if (!registeredRegistry.type.isInstance(event)) return@forEach0
-            val listener = registeredRegistry.listener
-            launch {
-                when (listener.concurrencyKind) {
-                    ConcurrencyKind.LOCKED -> {
-                        (listener as Handler).lock!!.withLock {
-                            if (listener.onEvent(event) == ListeningStatus.STOPPED) {
-                                remove(registeredRegistry)
-                            }
-                        }
-                    }
-                    ConcurrencyKind.CONCURRENT -> {
-                        if (listener.onEvent(event) == ListeningStatus.STOPPED) {
-                            remove(registeredRegistry)
-                        }
-                    }
+}
+
+/**
+ * If `true`, all event listeners runs directly in the broadcaster's thread until first suspension.
+ *
+ * If there is not suspension point in the listener, the coroutine executing [Event.broadcast] will not suspend,
+ * so the thread before and after execution will be the same and no other code is being executed if there is only one thread.
+ *
+ * This is useful for tests to not to depend on `delay`
+ */
+internal var EVENT_LAUNCH_UNDISPATCHED: Boolean by lateinitMutableProperty {
+    systemProp("mirai.event.launch.undispatched", false)
+}
+
+private suspend fun <E : AbstractEvent> process(
+    container: ConcurrentLinkedQueue<ListenerRegistry>,
+    registry: ListenerRegistry,
+    listener: Listener<Event>,
+    event: E,
+) {
+    when (listener.concurrencyKind) {
+        ConcurrencyKind.LOCKED -> {
+            (listener as Handler).lock!!.withLock {
+                if (listener.onEvent(event) == ListeningStatus.STOPPED) {
+                    container.remove(registry)
                 }
+            }
+        }
+        ConcurrencyKind.CONCURRENT -> {
+            if (listener.onEvent(event) == ListeningStatus.STOPPED) {
+                container.remove(registry)
             }
         }
     }
